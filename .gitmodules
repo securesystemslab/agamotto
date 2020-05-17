@@ -1,0 +1,6 @@
+[submodule "qemu"]
+	path = qemu
+	url = https://github.com/qemu/qemu.git
+[submodule "guest/linux/kernel"]
+	path = guest/linux/kernel
+	url = https://github.com/google/kasan.git

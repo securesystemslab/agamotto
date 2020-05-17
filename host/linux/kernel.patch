@@ -1,0 +1,908 @@
+diff --git arch/x86/include/asm/kvm_host.h arch/x86/include/asm/kvm_host.h
+index ccc23203b327..971ff35b2a74 100644
+--- arch/x86/include/asm/kvm_host.h
++++ arch/x86/include/asm/kvm_host.h
+@@ -311,6 +311,9 @@ struct kvm_mmu_page {
+ 
+ 	/* Number of writes since the last time traversal visited this page.  */
+ 	atomic_t write_flooding_count;
++   // mark pages for later dma tracing once the spte entry is added
++	DECLARE_BITMAP(dma_trace_active, 512);
++	DECLARE_BITMAP(cow_unsync_bitmap, 512);
+ };
+ 
+ struct kvm_pio_request {
+@@ -1136,6 +1139,7 @@ void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+ 		u64 acc_track_mask, u64 me_mask);
+ 
+ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
++int reset_cow_unsync_bitmap(struct kvm *kvm, struct kvm_memory_slot *memslot);
+ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ 				      struct kvm_memory_slot *memslot);
+ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+diff --git arch/x86/kvm/Kconfig arch/x86/kvm/Kconfig
+index 1bbec387d289..5c36d5c37fc0 100644
+--- arch/x86/kvm/Kconfig
++++ arch/x86/kvm/Kconfig
+@@ -71,6 +71,13 @@ config KVM_INTEL
+ 	  To compile this as a module, choose M here: the module
+ 	  will be called kvm-intel.
+ 
++config KVM_INTEL_AGAMOTTO
++	def_bool y
++	bool "KVM extension for Agamotto"
++	depends on KVM_INTEL
++	---help---
++	  Extends KVM_INTEL to support Agamotto hypercalls.
++
+ config KVM_AMD
+ 	tristate "KVM for AMD processors support"
+ 	depends on KVM
+diff --git arch/x86/kvm/Makefile arch/x86/kvm/Makefile
+index dc4f2fdf5e57..a9cfc7b5e620 100644
+--- arch/x86/kvm/Makefile
++++ arch/x86/kvm/Makefile
+@@ -16,6 +16,8 @@ kvm-y			+= x86.o mmu.o emulate.o i8259.o irq.o lapic.o \
+ 			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o mtrr.o \
+ 			   hyperv.o page_track.o debugfs.o
+ 
++kvm-$(CONFIG_KVM_INTEL_AGAMOTTO) += agamotto.o
++
+ kvm-intel-y		+= vmx.o pmu_intel.o
+ kvm-amd-y		+= svm.o pmu_amd.o
+ 
+diff --git arch/x86/kvm/agamotto.c arch/x86/kvm/agamotto.c
+new file mode 100644
+index 000000000000..e705a8cf9a9e
+--- /dev/null
++++ arch/x86/kvm/agamotto.c
+@@ -0,0 +1,55 @@
++#define pr_fmt(fmt) "agamotto: " fmt
++
++#include "x86.h"
++
++#include <linux/kvm_host.h>
++
++static int kvm_agamotto_hypercall_complete_userspace(struct kvm_vcpu *vcpu)
++{
++	kvm_register_write(vcpu, VCPU_REGS_RAX, vcpu->run->hypercall.ret);
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
++int kvm_agamotto_hypercall(struct kvm_vcpu *vcpu)
++{
++	unsigned long a0, a1, a2, a3, ret;
++
++	a0 = kvm_register_read(vcpu, VCPU_REGS_RBX);
++	a1 = kvm_register_read(vcpu, VCPU_REGS_RCX);
++	a2 = kvm_register_read(vcpu, VCPU_REGS_RDX);
++	a3 = kvm_register_read(vcpu, VCPU_REGS_RSI);
++
++	pr_debug("HyperCall %lu for Agamotto\n", a0);
++
++	switch (a0) {
++	case 0:
++		vcpu->run->exit_reason = KVM_EXIT_AGAMOTTO_BEGIN;
++		break;
++	case 1:
++		vcpu->run->exit_reason = KVM_EXIT_AGAMOTTO_END;
++		vcpu->run->hypercall.args[0] = a1;
++		break;
++	case 10:
++		vcpu->run->exit_reason = KVM_EXIT_AGAMOTTO_DEBUG;
++		vcpu->run->hypercall.args[0] = a1;
++		vcpu->run->hypercall.args[1] = a2;
++		vcpu->run->hypercall.args[2] = a3;
++		break;
++	default:
++		ret = -KVM_EPERM;
++		goto out;
++		break;
++	}
++
++	vcpu->arch.complete_userspace_io =
++		kvm_agamotto_hypercall_complete_userspace;
++
++	return 0;
++
++out:
++	kvm_register_write(vcpu, VCPU_REGS_RAX, ret);
++
++	++vcpu->stat.hypercalls;
++	return kvm_skip_emulated_instruction(vcpu);
++}
++EXPORT_SYMBOL_GPL(kvm_agamotto_hypercall);
+diff --git arch/x86/kvm/agamotto.h arch/x86/kvm/agamotto.h
+new file mode 100644
+index 000000000000..5a2ea61ef6e9
+--- /dev/null
++++ arch/x86/kvm/agamotto.h
+@@ -0,0 +1,6 @@
++#ifndef __ARCH_X86_KVM_AGAMOTTO_H__
++#define __ARCH_X86_KVM_AGAMOTTO_H__
++
++int kvm_agamotto_hypercall(struct kvm_vcpu *vcpu);
++
++#endif
+diff --git arch/x86/kvm/mmu.c arch/x86/kvm/mmu.c
+index d02f0390c1c1..2241a1da5092 100644
+--- arch/x86/kvm/mmu.c
++++ arch/x86/kvm/mmu.c
+@@ -203,6 +203,8 @@ static u64 __read_mostly shadow_mmio_value;
+ static u64 __read_mostly shadow_present_mask;
+ static u64 __read_mostly shadow_me_mask;
+ 
++static bool
++check_hugepage_cache_consistency(struct kvm_vcpu *vcpu, gfn_t gfn, int level);
+ /*
+  * SPTEs used by MMUs without A/D bits are marked with shadow_acc_track_value.
+  * Non-present SPTEs with shadow_acc_track_value set are in place for access
+@@ -452,6 +454,11 @@ static int is_nx(struct kvm_vcpu *vcpu)
+ 	return vcpu->arch.efer & EFER_NX;
+ }
+ 
++static int is_shadow_present_mmio_pte(u64 pte)
++{
++	return (pte != 0);
++}
++
+ static int is_shadow_present_pte(u64 pte)
+ {
+ 	return (pte != 0) && !is_mmio_spte(pte);
+@@ -1326,9 +1333,15 @@ static void rmap_remove(struct kvm *kvm, u64 *spte)
+ 	struct kvm_mmu_page *sp;
+ 	gfn_t gfn;
+ 	struct kvm_rmap_head *rmap_head;
++   unsigned int index;
+ 
+ 	sp = page_header(__pa(spte));
+-	gfn = kvm_mmu_page_get_gfn(sp, spte - sp->spt);
++
++   // clear dma active trace marker
++	index = spte - sp->spt;
++	__clear_bit(index, sp->dma_trace_active);
++
++	gfn = kvm_mmu_page_get_gfn(sp, index);
+ 	rmap_head = gfn_to_rmap(kvm, gfn, sp);
+ 	pte_list_remove(spte, rmap_head);
+ }
+@@ -1355,8 +1368,9 @@ static u64 *rmap_get_first(struct kvm_rmap_head *rmap_head,
+ {
+ 	u64 *sptep;
+ 
+-	if (!rmap_head->val)
++	if (!rmap_head->val) {
+ 		return NULL;
++   }
+ 
+ 	if (!(rmap_head->val & 1)) {
+ 		iter->desc = NULL;
+@@ -1451,6 +1465,7 @@ static void drop_large_spte(struct kvm_vcpu *vcpu, u64 *sptep)
+ static bool spte_write_protect(u64 *sptep, bool pt_protect)
+ {
+ 	u64 spte = *sptep;
++	bool r;
+ 
+ 	if (!is_writable_pte(spte) &&
+ 	      !(pt_protect && spte_can_locklessly_be_made_writable(spte)))
+@@ -1462,7 +1477,8 @@ static bool spte_write_protect(u64 *sptep, bool pt_protect)
+ 		spte &= ~SPTE_MMU_WRITEABLE;
+ 	spte = spte & ~PT_WRITABLE_MASK;
+ 
+-	return mmu_spte_update(sptep, spte);
++	r =  mmu_spte_update(sptep, spte);
++	return r;
+ }
+ 
+ static bool __rmap_write_protect(struct kvm *kvm,
+@@ -1473,8 +1489,9 @@ static bool __rmap_write_protect(struct kvm *kvm,
+ 	struct rmap_iterator iter;
+ 	bool flush = false;
+ 
+-	for_each_rmap_spte(rmap_head, &iter, sptep)
++	for_each_rmap_spte(rmap_head, &iter, sptep) {
+ 		flush |= spte_write_protect(sptep, pt_protect);
++   }
+ 
+ 	return flush;
+ }
+@@ -1512,11 +1529,13 @@ static bool __rmap_clear_dirty(struct kvm *kvm, struct kvm_rmap_head *rmap_head)
+ 	struct rmap_iterator iter;
+ 	bool flush = false;
+ 
+-	for_each_rmap_spte(rmap_head, &iter, sptep)
++	//pr_err("%s: Enter\n", __FUNCTION__);
++	for_each_rmap_spte(rmap_head, &iter, sptep) {
+ 		if (spte_ad_enabled(*sptep))
+ 			flush |= spte_clear_dirty(sptep);
+ 		else
+ 			flush |= wrprot_ad_disabled_spte(sptep);
++   }
+ 
+ 	return flush;
+ }
+@@ -1538,9 +1557,11 @@ static bool __rmap_set_dirty(struct kvm *kvm, struct kvm_rmap_head *rmap_head)
+ 	struct rmap_iterator iter;
+ 	bool flush = false;
+ 
+-	for_each_rmap_spte(rmap_head, &iter, sptep)
++	//pr_err("%s: Enter\n", __FUNCTION__);
++	for_each_rmap_spte(rmap_head, &iter, sptep) {
+ 		if (spte_ad_enabled(*sptep))
+ 			flush |= spte_set_dirty(sptep);
++   }
+ 
+ 	return flush;
+ }
+@@ -1662,6 +1683,7 @@ static bool kvm_zap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head)
+ 	u64 *sptep;
+ 	struct rmap_iterator iter;
+ 	bool flush = false;
++	//pr_err("%s: Enter\n", __FUNCTION__);
+ 
+ 	while ((sptep = rmap_get_first(rmap_head, &iter))) {
+ 		rmap_printk("%s: spte %p %llx.\n", __func__, sptep, *sptep);
+@@ -1873,6 +1895,7 @@ static int kvm_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ 	struct rmap_iterator uninitialized_var(iter);
+ 	int young = 0;
+ 
++	//pr_err("%s: Enter\n", __FUNCTION__);
+ 	for_each_rmap_spte(rmap_head, &iter, sptep)
+ 		young |= mmu_spte_age(sptep);
+ 
+@@ -1887,6 +1910,7 @@ static int kvm_test_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ 	u64 *sptep;
+ 	struct rmap_iterator iter;
+ 
++	//pr_err("%s: Enter\n", __FUNCTION__);
+ 	for_each_rmap_spte(rmap_head, &iter, sptep)
+ 		if (is_accessed_spte(*sptep))
+ 			return 1;
+@@ -2010,6 +2034,7 @@ static void kvm_mmu_mark_parents_unsync(struct kvm_mmu_page *sp)
+ 	u64 *sptep;
+ 	struct rmap_iterator iter;
+ 
++	//pr_err("%s: Enter\n", __FUNCTION__);
+ 	for_each_rmap_spte(&sp->parent_ptes, &iter, sptep) {
+ 		mark_unsync(sptep);
+ 	}
+@@ -3028,11 +3053,21 @@ static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
+ 
+ 	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
+ 		if (iterator.level == level) {
+-			emulate = mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
+-					       write, level, gfn, pfn, prefault,
+-					       map_writable);
+-			direct_pte_prefetch(vcpu, iterator.sptep);
++         sp = page_header(__pa(iterator.sptep));
++         if(sp && test_and_clear_bit(iterator.index, sp->dma_trace_active)) {
++            pr_info("dma trace bit set -> setting old %llx\n", *iterator.sptep);
++            emulate = mmu_set_spte(vcpu, iterator.sptep, ACC_ALL, false /*write fault*/,
++                  iterator.level, gfn, KVM_PFN_NOSLOT, false /*speculative*/, true /*host writable*/);
++            pr_info("dma trace bit set -> setting new %llx\n", *iterator.sptep);
++         } else {
++            emulate = mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
++                  write, level, gfn, pfn, prefault,
++                  map_writable);
++            direct_pte_prefetch(vcpu, iterator.sptep);
++         }
++
+ 			++vcpu->stat.pf_fixed;
++
+ 			break;
+ 		}
+ 
+@@ -3254,9 +3289,18 @@ static bool fast_page_fault(struct kvm_vcpu *vcpu, gva_t gva, int level,
+ 			    iterator.level < level)
+ 				break;
+ 
+-		sp = page_header(__pa(iterator.sptep));
+-		if (!is_last_spte(spte, sp->role.level))
+-			break;
++      sp = page_header(__pa(iterator.sptep));
++      // if this is a write access and we are in cow mode and
++      // the page is not yet synced, we need to trigger the slow path and get the
++      // new hpa
++      //if ((error_code & PFERR_WRITE_MASK) &&
++      //      test_and_clear_bit(iterator.index, sp->cow_unsync_bitmap)) {
++      //   pr_err("%s: cow unsync gva %llx\n", __FUNCTION__, (unsigned long long)gva);
++      //   fault_handled = false;
++      //   break;
++      //}
++      if (!is_last_spte(spte, sp->role.level))
++         break;
+ 
+ 		/*
+ 		 * Check whether the memory access that caused the fault would
+@@ -3334,6 +3378,197 @@ static bool fast_page_fault(struct kvm_vcpu *vcpu, gva_t gva, int level,
+ 	return fault_handled;
+ }
+ 
++static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
++			  bool prefault);
++static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
++			 gva_t gva, kvm_pfn_t *pfn, bool write, bool *writable);
++int dma_stop_trace(struct kvm_vcpu *vcpu, gpa_t gpa)
++{
++	struct kvm_shadow_walk_iterator iterator;
++	struct kvm_mmu_page *sp;
++	bool request_handled = false;
++	int level;
++	gfn_t gfn = gpa >> PAGE_SHIFT;
++	bool force_pt_level;
++	kvm_pfn_t pfn;
++   bool map_writable;
++	int r;
++
++	MMU_WARN_ON(!VALID_PAGE(vcpu->arch.mmu.root_hpa));
++
++	// TODO: what does this do?
++	r = mmu_topup_memory_caches(vcpu);
++	if (r)
++		return r;
++
++	// TODO: what does this do?
++	force_pt_level = !check_hugepage_cache_consistency(vcpu, gfn,
++			PT_DIRECTORY_LEVEL);
++	level = mapping_level(vcpu, gfn, &force_pt_level);
++
++	if (likely(!force_pt_level)) {
++		if (level > PT_DIRECTORY_LEVEL &&
++				!check_hugepage_cache_consistency(vcpu, gfn, level)) {
++			level = PT_DIRECTORY_LEVEL;
++		}
++		gfn &= ~(KVM_PAGES_PER_HPAGE(level) - 1);
++	}
++
++	if (level != 1) {
++		pr_err("%s: Error invalid page level\n", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa)) {
++		pr_err("%s: Error invalid page level\n", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	//pr_info("%s: gpa %llx, level %d (dir level %d)\n", __FUNCTION__, gpa, level, PT_DIRECTORY_LEVEL);
++
++	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
++		if (iterator.level == level) {
++         // clear the dma trace bit
++         sp = page_header(__pa(iterator.sptep));
++         // clear bit to avoid later tracing when spte is populated
++         clear_bit(iterator.index, sp->dma_trace_active);
++         // mark request as handled when we cleared the bit (even when there is no spte yet)
++         request_handled = true;
++         if (is_shadow_present_mmio_pte(*iterator.sptep) && is_mmio_spte(*iterator.sptep)) {
++            // if there is an spte -> modify it to stop tracing
++            //pr_info("%s: old spte %llx %llx\n",
++            //      __FUNCTION__, (unsigned long long)iterator.sptep, *iterator.sptep);
++            // get the host pfn
++            if (!try_async_pf(vcpu, false /*prefault*/, gfn, gpa, &pfn, true /*write*/, &map_writable)) {
++               mmu_set_spte(vcpu, iterator.sptep, ACC_ALL, false /*write fault*/,
++                     iterator.level, gfn, pfn, false /*speculative*/, true /*host writable*/);
++               clear_bit(iterator.index, sp->dma_trace_active);
++               //pr_info("%s: new_spte %llx %llx\n",
++               //      __FUNCTION__, (unsigned long long)iterator.sptep, *iterator.sptep);
++            } else {
++               pr_warn("%s: Error could not get pfn for %llx -> %llx\n",
++                     __FUNCTION__, (unsigned long long)iterator.sptep, *iterator.sptep);
++               request_handled = false;
++            }
++         } else if(!is_shadow_present_mmio_pte(*iterator.sptep)) {
++            pr_warn("%s: Warning spte is not present %llx -> %llx\n", __FUNCTION__, (unsigned long long)iterator.sptep, *iterator.sptep);
++         } else if(!is_mmio_spte(*iterator.sptep)) {
++            pr_warn("%s: Warning spte is not mmio %llx -> %llx\n", __FUNCTION__, (unsigned long long)iterator.sptep, *iterator.sptep);
++         }
++      }
++	}
++
++	if (!request_handled) {
++		pr_err("%s: no spte found\n", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	return 0;
++
++}
++EXPORT_SYMBOL(dma_stop_trace);
++
++
++// remove ept entry -> this will trigger mmio handling (hopefully)
++int dma_start_trace(struct kvm_vcpu *vcpu, gpa_t gpa)
++{
++	struct kvm_shadow_walk_iterator iterator;
++	struct kvm_mmu_page *sp;
++	bool request_handled = false;
++	int level;
++	gfn_t gfn = gpa >> PAGE_SHIFT;
++	bool force_pt_level;
++	//gfn_t pseudo_gfn;
++	int r;
++
++	MMU_WARN_ON(!VALID_PAGE(vcpu->arch.mmu->root_hpa));
++
++	// TODO: what does this do?
++	r = mmu_topup_memory_caches(vcpu);
++	if (r)
++		return r;
++
++	// TODO: what does this do?
++	force_pt_level = !check_hugepage_cache_consistency(vcpu, gfn,
++			PT_DIRECTORY_LEVEL);
++	level = mapping_level(vcpu, gfn, &force_pt_level);
++
++	if (likely(!force_pt_level)) {
++		if (level > PT_DIRECTORY_LEVEL &&
++				!check_hugepage_cache_consistency(vcpu, gfn, level)) {
++			level = PT_DIRECTORY_LEVEL;
++		}
++		gfn &= ~(KVM_PAGES_PER_HPAGE(level) - 1);
++	}
++
++	if (level != 1) {
++		pr_err("%s: Error invalid page level\n", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa)) {
++		pr_err("%s: Error no valid root_hpa page\n", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	//pr_info("%s: gpa %llx, level %d (dir level %d)\n", __FUNCTION__, gpa, level, PT_DIRECTORY_LEVEL);
++
++	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
++		if (iterator.level == level) {
++         sp = page_header(__pa(iterator.sptep));
++         if(!test_bit(iterator.index, sp->dma_trace_active)) {
++            if(is_mmio_spte(*iterator.sptep)) {
++               pr_warn("Error: gpa %llx already marked as mmio\n", gpa);
++               break;
++            }
++            // request handled, when bit for later trace could be set
++            request_handled = true;
++            if (is_shadow_present_pte(*iterator.sptep)) {
++               //pr_info("%s: old spte %llx %llx\n",
++               //      __FUNCTION__, (unsigned long long)iterator.sptep, *iterator.sptep);
++               // KVM_PFN_NOSLOT -> will trigger allocation of mmio spte in mmu_set_spte
++               // mmu_set_spte should take care of setting up all the meta structured properly
++               mmu_set_spte(vcpu, iterator.sptep, ACC_ALL, false /*write fault*/,
++                  iterator.level, gfn, KVM_PFN_NOSLOT, false /*speculative*/, true /*host writable*/);
++               //pr_info("%s: new_spte %llx %llx\n",
++               //      __FUNCTION__, (unsigned long long)iterator.sptep, *iterator.sptep);
++               // TODO: check if mmu_set_spte already flushed tlbs
++               //kvm_flush_remote_tlbs_with_address(vcpu->kvm, gfn, 1);
++               // TODO: check if mmu_set_stpe clears the kvm_mmu_page structure which holds the bitmap
++               set_bit(iterator.index, sp->dma_trace_active);
++               break;
++            }
++            // TODO: check if mmu_set_stpe clears the kvm_mmu_page structure which holds the bitmap
++            set_bit(iterator.index, sp->dma_trace_active);
++         }
++      }
++
++      // TODO: this causes kernel BUG on ptr_list_remove -> not sure if we need it, allocates upper page table levels
++		//drop_large_spte(vcpu, iterator.sptep);
++		//if (!is_shadow_present_pte(*iterator.sptep)) {
++		//	u64 base_addr = iterator.addr;
++
++		//	base_addr &= PT64_LVL_ADDR_MASK(iterator.level);
++		//	pseudo_gfn = base_addr >> PAGE_SHIFT;
++		//	sp = kvm_mmu_get_page(vcpu, pseudo_gfn, iterator.addr,
++		//			      iterator.level - 1, 1, ACC_ALL);
++
++		//	link_shadow_page(vcpu, iterator.sptep, sp);
++		//}
++	}
++
++	if (!request_handled) {
++		pr_err("%s: no spte found\n", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	return 0;
++
++}
++EXPORT_SYMBOL(dma_start_trace);
++
++
++
+ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
+ 			 gva_t gva, kvm_pfn_t *pfn, bool write, bool *writable);
+ static int make_mmu_pages_available(struct kvm_vcpu *vcpu);
+@@ -3737,19 +3972,24 @@ static int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct)
+ 	u64 spte;
+ 	bool reserved;
+ 
+-	if (mmio_info_in_cache(vcpu, addr, direct))
++	if (mmio_info_in_cache(vcpu, addr, direct)) {
+ 		return RET_PF_EMULATE;
++	}
+ 
+ 	reserved = walk_shadow_page_get_mmio_spte(vcpu, addr, &spte);
+-	if (WARN_ON(reserved))
++	if (WARN_ON(reserved)) {
++		pr_err("%s: reserved\n", __FUNCTION__);
+ 		return -EINVAL;
++	}
+ 
+ 	if (is_mmio_spte(spte)) {
+ 		gfn_t gfn = get_mmio_spte_gfn(spte);
+ 		unsigned access = get_mmio_spte_access(spte);
+ 
+-		if (!check_mmio_spte(vcpu, spte))
++		if (!check_mmio_spte(vcpu, spte)) {
++			pr_err("%s: mmio_invalid\n", __FUNCTION__);
+ 			return RET_PF_INVALID;
++		}
+ 
+ 		if (direct)
+ 			addr = 0;
+@@ -3757,6 +3997,8 @@ static int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct)
+ 		trace_handle_mmio_page_fault(addr, gfn, access);
+ 		vcpu_cache_mmio_info(vcpu, addr, gfn, access);
+ 		return RET_PF_EMULATE;
++	} else {
++		pr_err("%s: no mmio_spte\n", __FUNCTION__);
+ 	}
+ 
+ 	/*
+@@ -5277,6 +5519,34 @@ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ 		kvm_flush_remote_tlbs(kvm);
+ }
+ 
++static bool reset_cow_unsync_bitmap_cb(struct kvm *kvm,
++				    struct kvm_rmap_head *rmap_head)
++{
++	u64 *sptep;
++	struct rmap_iterator iter;
++   struct kvm_mmu_page *sp;
++
++	for_each_rmap_spte(rmap_head, &iter, sptep) {
++      sp = page_header(__pa(sptep));
++      //pr_err("%s: %llx\n", __FUNCTION__, (unsigned long long)sp);
++      if(sp) {
++         memset(sp->cow_unsync_bitmap, 1, 512 / 8);
++         memset(sp->dma_trace_active, 0, 512 / 8);
++      }
++   }
++   return false;
++}
++
++
++int reset_cow_unsync_bitmap(struct kvm *kvm, struct kvm_memory_slot *memslot)
++{
++	spin_lock(&kvm->mmu_lock);
++	slot_handle_all_level(kvm, memslot, reset_cow_unsync_bitmap_cb,
++				      false);
++	spin_unlock(&kvm->mmu_lock);
++   return 0;
++}
++
+ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
+ 					 struct kvm_rmap_head *rmap_head)
+ {
+@@ -5286,8 +5556,10 @@ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
+ 	kvm_pfn_t pfn;
+ 	struct kvm_mmu_page *sp;
+ 
++	//pr_err("%s: Enter\n", __FUNCTION__);
+ restart:
+ 	for_each_rmap_spte(rmap_head, &iter, sptep) {
++
+ 		sp = page_header(__pa(sptep));
+ 		pfn = spte_to_pfn(*sptep);
+ 
+diff --git arch/x86/kvm/mmu.h arch/x86/kvm/mmu.h
+index 5b408c0ad612..eec4eb0d1e22 100644
+--- arch/x86/kvm/mmu.h
++++ arch/x86/kvm/mmu.h
+@@ -67,6 +67,7 @@ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
+ bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu);
+ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
+ 				u64 fault_address, char *insn, int insn_len);
++//int dma_start_trace(struct kvm_vcpu *vcpu, gva_t gva);
+ 
+ static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+ {
+diff --git arch/x86/kvm/x86.c arch/x86/kvm/x86.c
+index 8ec2e13d8a9c..88c229f1cd36 100644
+--- arch/x86/kvm/x86.c
++++ arch/x86/kvm/x86.c
+@@ -30,6 +30,8 @@
+ #include "pmu.h"
+ #include "hyperv.h"
+ 
++#include "agamotto.h"
++
+ #include <linux/clocksource.h>
+ #include <linux/interrupt.h>
+ #include <linux/kvm.h>
+@@ -5134,8 +5136,9 @@ static int emulator_read_write(struct x86_emulate_ctxt *ctxt,
+ 	int rc;
+ 
+ 	if (ops->read_write_prepare &&
+-		  ops->read_write_prepare(vcpu, val, bytes))
++		  ops->read_write_prepare(vcpu, val, bytes)) {
+ 		return X86EMUL_CONTINUE;
++	}
+ 
+ 	vcpu->mmio_nr_fragments = 0;
+ 
+@@ -5158,11 +5161,13 @@ static int emulator_read_write(struct x86_emulate_ctxt *ctxt,
+ 
+ 	rc = emulator_read_write_onepage(addr, val, bytes, exception,
+ 					 vcpu, ops);
+-	if (rc != X86EMUL_CONTINUE)
++	if (rc != X86EMUL_CONTINUE) {
+ 		return rc;
++	}
+ 
+-	if (!vcpu->mmio_nr_fragments)
++	if (!vcpu->mmio_nr_fragments) {
+ 		return rc;
++	}
+ 
+ 	gpa = vcpu->mmio_fragments[0].gpa;
+ 
+@@ -6771,6 +6776,12 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (kvm_x86_ops->get_cpl(vcpu) != 0) {
++#ifdef CONFIG_KVM_INTEL_AGAMOTTO
++		if (nr == KVM_HC_AGAMOTTO) {
++			return kvm_agamotto_hypercall(vcpu);
++		}
++#endif
++
+ 		ret = -KVM_EPERM;
+ 		goto out;
+ 	}
+diff --git include/linux/kvm_host.h include/linux/kvm_host.h
+index 4ee7bc548a83..d56b0e3a076c 100644
+--- include/linux/kvm_host.h
++++ include/linux/kvm_host.h
+@@ -616,8 +616,11 @@ enum kvm_mr_change {
+ 	KVM_MR_DELETE,
+ 	KVM_MR_MOVE,
+ 	KVM_MR_FLAGS_ONLY,
++	KVM_MR_FLAGS_NOT_PRESENT,
+ };
+ 
++int dma_start_trace(struct kvm_vcpu *vcpu, gpa_t gpa);
++int dma_stop_trace(struct kvm_vcpu *vcpu, gpa_t gpa);
+ int kvm_set_memory_region(struct kvm *kvm,
+ 			  const struct kvm_userspace_memory_region *mem);
+ int __kvm_set_memory_region(struct kvm *kvm,
+diff --git include/uapi/linux/kvm.h include/uapi/linux/kvm.h
+index b6270a3b38e9..c4b93280e569 100644
+--- include/uapi/linux/kvm.h
++++ include/uapi/linux/kvm.h
+@@ -109,6 +109,8 @@ struct kvm_userspace_memory_region {
+  */
+ #define KVM_MEM_LOG_DIRTY_PAGES	(1UL << 0)
+ #define KVM_MEM_READONLY	(1UL << 1)
++// XXX TODO
++#define KVM_MEM_NOT_PRESENT	(1UL << 1)
+ 
+ /* for KVM_IRQ_LINE */
+ struct kvm_irq_level {
+@@ -207,6 +209,10 @@ struct kvm_hyperv_exit {
+ #define KVM_S390_GET_SKEYS_NONE   1
+ #define KVM_S390_SKEYS_MAX        1048576
+ 
++#define KVM_EXIT_AGAMOTTO_BEGIN  100
++#define KVM_EXIT_AGAMOTTO_END    101
++#define KVM_EXIT_AGAMOTTO_DEBUG  110
++
+ #define KVM_EXIT_UNKNOWN          0
+ #define KVM_EXIT_EXCEPTION        1
+ #define KVM_EXIT_IO               2
+@@ -1391,6 +1397,10 @@ struct kvm_enc_region {
+ /* Available with KVM_CAP_HYPERV_EVENTFD */
+ #define KVM_HYPERV_EVENTFD        _IOW(KVMIO,  0xbd, struct kvm_hyperv_eventfd)
+ 
++#define KVM_ENABLE_DMA_TRACE      _IO(KVMIO,   0xc2)
++#define KVM_DISABLE_DMA_TRACE     _IO(KVMIO,   0xc3)
++#define KVM_UPDATE_USER_MEMORY_REGION _IOW(KVMIO, 0xc4, \
++					struct kvm_userspace_memory_region)
+ 
+ /* Secure Encrypted Virtualization command */
+ enum sev_cmd_id {
+diff --git include/uapi/linux/kvm_para.h include/uapi/linux/kvm_para.h
+index dcf629dd2889..b1c239e87a5c 100644
+--- include/uapi/linux/kvm_para.h
++++ include/uapi/linux/kvm_para.h
+@@ -17,6 +17,8 @@
+ #define KVM_EPERM		EPERM
+ #define KVM_EOPNOTSUPP		95
+ 
++#define KVM_HC_AGAMOTTO		20
++
+ #define KVM_HC_VAPIC_POLL_IRQ		1
+ #define KVM_HC_MMU_OP			2
+ #define KVM_HC_FEATURES			3
+diff --git virt/kvm/kvm_main.c virt/kvm/kvm_main.c
+index 8eab43081398..89800f505b50 100644
+--- virt/kvm/kvm_main.c
++++ virt/kvm/kvm_main.c
+@@ -904,6 +904,62 @@ static struct kvm_memslots *install_new_memslots(struct kvm *kvm,
+  *
+  * Must be called holding kvm->slots_lock for write.
+  */
++int __kvm_update_memory_region(struct kvm *kvm,
++			    const struct kvm_userspace_memory_region *mem)
++{
++	int r;
++	unsigned long npages;
++	struct kvm_memory_slot *slot;
++	int as_id, id;
++
++	r = check_memory_region_flags(mem);
++	if (r)
++		goto out;
++
++	r = -EINVAL;
++	as_id = mem->slot >> 16;
++	id = (u16)mem->slot;
++
++	/* General sanity checks */
++	if (mem->memory_size & (PAGE_SIZE - 1))
++		goto out;
++	if (mem->guest_phys_addr & (PAGE_SIZE - 1))
++		goto out;
++	/* We can read the guest memory with __xxx_user() later on. */
++	if ((id < KVM_USER_MEM_SLOTS) &&
++	    ((mem->userspace_addr & (PAGE_SIZE - 1)) ||
++	     !access_ok(VERIFY_WRITE,
++			(void __user *)(unsigned long)mem->userspace_addr,
++			mem->memory_size)))
++		goto out;
++	if (as_id >= KVM_ADDRESS_SPACE_NUM || id >= KVM_MEM_SLOTS_NUM)
++		goto out;
++	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
++		goto out;
++
++	slot = id_to_memslot(__kvm_memslots(kvm, as_id), id);
++	npages = mem->memory_size >> PAGE_SHIFT;
++
++	if (npages > KVM_MEM_MAX_NR_PAGES)
++		goto out;
++
++   //pr_err("%s: new %llx, old %lx\n", __FUNCTION__, mem->userspace_addr, slot->userspace_addr);
++   //new.userspace_addr = mem->userspace_addr;
++   slot->userspace_addr = mem->userspace_addr;
++   //reset_cow_unsync_bitmap(kvm, slot);
++   //kvm_mmu_slot_remove_write_access(kvm, slot);
++   // we need to remove all mappings because
++   // the host migth trigger a cow
++   // leaving the guest with a stale spt entry
++   kvm_arch_flush_shadow_memslot(kvm, slot);
++
++	return 0;
++
++out:
++	return r;
++}
++EXPORT_SYMBOL_GPL(__kvm_update_memory_region);
++
+ int __kvm_set_memory_region(struct kvm *kvm,
+ 			    const struct kvm_userspace_memory_region *mem)
+ {
+@@ -1068,6 +1124,19 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ }
+ EXPORT_SYMBOL_GPL(__kvm_set_memory_region);
+ 
++int kvm_update_memory_region(struct kvm *kvm,
++			  const struct kvm_userspace_memory_region *mem)
++{
++	int r;
++
++	mutex_lock(&kvm->slots_lock);
++	r = __kvm_update_memory_region(kvm, mem);
++	mutex_unlock(&kvm->slots_lock);
++	return r;
++}
++EXPORT_SYMBOL_GPL(kvm_update_memory_region);
++
++
+ int kvm_set_memory_region(struct kvm *kvm,
+ 			  const struct kvm_userspace_memory_region *mem)
+ {
+@@ -1080,6 +1149,33 @@ int kvm_set_memory_region(struct kvm *kvm,
+ }
+ EXPORT_SYMBOL_GPL(kvm_set_memory_region);
+ 
++static int kvm_vm_ioctl_disable_dma_trace(struct kvm *kvm, gva_t gva)
++{
++	// todo: fix vcpu index
++	if (atomic_read(&kvm->online_vcpus) > 0) {
++		return dma_stop_trace(kvm->vcpus[0], gva);
++	}
++	return -EINVAL;
++}
++
++static int kvm_vm_ioctl_enable_dma_trace(struct kvm *kvm, gva_t gva)
++{
++	// todo: fix vcpu index
++	if (atomic_read(&kvm->online_vcpus) > 0) {
++		return dma_start_trace(kvm->vcpus[0], gva);
++	}
++	return -EINVAL;
++}
++
++static int kvm_vm_ioctl_update_memory_region(struct kvm *kvm,
++					  struct kvm_userspace_memory_region *mem)
++{
++	if ((u16)mem->slot >= KVM_USER_MEM_SLOTS)
++		return -EINVAL;
++
++	return kvm_update_memory_region(kvm, mem);
++}
++
+ static int kvm_vm_ioctl_set_memory_region(struct kvm *kvm,
+ 					  struct kvm_userspace_memory_region *mem)
+ {
+@@ -1390,7 +1486,8 @@ static int hva_to_pfn_slow(unsigned long addr, bool *async, bool write_fault,
+ 	if (writable)
+ 		*writable = write_fault;
+ 
+-	if (write_fault)
++   // XXX
++	//if (write_fault)
+ 		flags |= FOLL_WRITE;
+ 	if (async)
+ 		flags |= FOLL_NOWAIT;
+@@ -1432,6 +1529,8 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 	unsigned long pfn;
+ 	int r;
+ 
++	// XXX
++	write_fault = true;
+ 	r = follow_pfn(vma, addr, &pfn);
+ 	if (r) {
+ 		/*
+@@ -1466,7 +1565,7 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 	 * Whoever called remap_pfn_range is also going to call e.g.
+ 	 * unmap_mapping_range before the underlying pages are freed,
+ 	 * causing a call to our MMU notifier.
+-	 */ 
++	 */
+ 	kvm_get_pfn(pfn);
+ 
+ 	*p_pfn = pfn;
+@@ -2967,6 +3066,17 @@ static long kvm_vm_ioctl(struct file *filp,
+ 	case KVM_CREATE_VCPU:
+ 		r = kvm_vm_ioctl_create_vcpu(kvm, arg);
+ 		break;
++	case KVM_UPDATE_USER_MEMORY_REGION: {
++		struct kvm_userspace_memory_region kvm_userspace_mem;
++
++		r = -EFAULT;
++		if (copy_from_user(&kvm_userspace_mem, argp,
++						sizeof(kvm_userspace_mem)))
++			goto out;
++
++		r = kvm_vm_ioctl_update_memory_region(kvm, &kvm_userspace_mem);
++		break;
++	}
+ 	case KVM_SET_USER_MEMORY_REGION: {
+ 		struct kvm_userspace_memory_region kvm_userspace_mem;
+ 
+@@ -2978,6 +3088,14 @@ static long kvm_vm_ioctl(struct file *filp,
+ 		r = kvm_vm_ioctl_set_memory_region(kvm, &kvm_userspace_mem);
+ 		break;
+ 	}
++	case KVM_ENABLE_DMA_TRACE: {
++		r = kvm_vm_ioctl_enable_dma_trace(kvm, arg);
++		break;
++	}
++	case KVM_DISABLE_DMA_TRACE: {
++		r = kvm_vm_ioctl_disable_dma_trace(kvm, arg);
++		break;
++	}
+ 	case KVM_GET_DIRTY_LOG: {
+ 		struct kvm_dirty_log log;
+ 

@@ -1,0 +1,9 @@
+*~
+*.swp
+.DS_Store
+/.vscode/
+/build/
+/configs/syzkaller/generated/
+/scripts/chroot/
+/scripts/stretch.*
+__pycache__/
