@@ -21,7 +21,10 @@ export AGPATH=$PWD # assumed by commands that follow
 
 ### Change the host Linux kernel for custom hypercall support
 
-Build the host Linux kernel with [our patch](host/linux/kernel.patch) applied, and with `CONFIG_KVM_INTEL_AGAMOTTO=y`, and install & reboot it.
+Build the host Linux kernel with [our patch](host/linux/kernel.patch) applied, and with `CONFIG_KVM_AGAMOTTO=y`, and install & reboot it.
+
+#### Tested environment:
+- [Ubuntu-hwe-4.18.0-18.19_18.04.1](https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/bionic) on AMD EPYC 7601
 
 
 ### Download and build Syzkaller
