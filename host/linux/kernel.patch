@@ -24,16 +24,15 @@ diff --git arch/x86/kvm/Kconfig arch/x86/kvm/Kconfig
 index 1bbec387d289..5c36d5c37fc0 100644
 --- arch/x86/kvm/Kconfig
 +++ arch/x86/kvm/Kconfig
-@@ -71,6 +71,13 @@ config KVM_INTEL
+@@ -71,6 +71,12 @@ config KVM_INTEL
  	  To compile this as a module, choose M here: the module
  	  will be called kvm-intel.
  
-+config KVM_INTEL_AGAMOTTO
++config KVM_AGAMOTTO
 +	def_bool y
 +	bool "KVM extension for Agamotto"
-+	depends on KVM_INTEL
 +	---help---
-+	  Extends KVM_INTEL to support Agamotto hypercalls.
++	  Extends KVM to support Agamotto hypercalls.
 +
  config KVM_AMD
  	tristate "KVM for AMD processors support"
@@ -46,7 +45,7 @@ index dc4f2fdf5e57..a9cfc7b5e620 100644
  			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o mtrr.o \
  			   hyperv.o page_track.o debugfs.o
  
-+kvm-$(CONFIG_KVM_INTEL_AGAMOTTO) += agamotto.o
++kvm-$(CONFIG_KVM_AGAMOTTO) += agamotto.o
 +
  kvm-intel-y		+= vmx.o pmu_intel.o
  kvm-amd-y		+= svm.o pmu_amd.o
@@ -651,7 +650,7 @@ index 8ec2e13d8a9c..88c229f1cd36 100644
  	}
  
  	if (kvm_x86_ops->get_cpl(vcpu) != 0) {
-+#ifdef CONFIG_KVM_INTEL_AGAMOTTO
++#ifdef CONFIG_KVM_AGAMOTTO
 +		if (nr == KVM_HC_AGAMOTTO) {
 +			return kvm_agamotto_hypercall(vcpu);
 +		}
