@@ -382,7 +382,7 @@ def run_qemu(kernel_dir, drive_path, dev, prog,
 
 
 def check_dependencies():
-    files_to_check = [QEMU_RUN_SH, "afl-whatsup"]
+    files_to_check = [QEMU_RUN_SH]
     for f in files_to_check:
         if not os.path.exists(f):
             raise Exception("File '%s' does not exist." % (f))
