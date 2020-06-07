@@ -108,6 +108,6 @@ cd $AGPATH/scripts
 ./create-overlay-image.py rtl8139 -d stretch.img
 export PATH=$AGPATH/build/qemu/install/bin:$PATH
 export LD_LIBRARY_PATH=$AGPATH/build/libagamotto:$LD_LIBRARY_PATH
-./fuzz.py rtl8139 -g linux-prog06 -i seed/ -N <number of fuzzing instances>
+./fuzz.py rtl8139 -g linux-prog05 -i seed/ -N <number of fuzzing instances>
 ```
 
