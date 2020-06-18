@@ -111,3 +111,16 @@ export LD_LIBRARY_PATH=$AGPATH/build/libagamotto:$LD_LIBRARY_PATH
 ./fuzz.py rtl8139 -g linux-prog05 -i seed/ -N <number of fuzzing instances>
 ```
 
+## Citing our work
+
+```
+@inproceedings{song2020agamotto,
+  title =        {{Agamotto}: Accelerating Kernel Driver Fuzzing with
+                  Lightweight Virtual Machine Checkpoints},
+  author =       {Song, Dokyung and Hetzelt, Felicitas and Kim, Jonghwan and
+                  Kang, Brent Byunghoon and Seifert, Jean-Pierre and Franz,
+                  Michael},
+  booktitle =    {{USENIX} Security Symposium},
+  year =         {2020}
+}
+```
